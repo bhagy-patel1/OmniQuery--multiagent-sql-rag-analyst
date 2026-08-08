@@ -22,8 +22,8 @@ CREATE TABLE document_chunks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_name VARCHAR(255),
     chunk_content TEXT,
-    embedding vector(1536),           -- Dense vector for OpenAI embeddings
-    fts_tokens tsvector               -- Sparse vector for BM25 keyword matching
+    embedding vector(1024),          -- UPDATED: 1024 for Cohere embed-english-v3.0
+    fts_tokens tsvector              -- Sparse vector for BM25 keyword matching
 );
 
 -- 3. Create Indexes for fast retrieval
