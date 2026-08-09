@@ -30,17 +30,42 @@ llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 
 
 def get_database_schema() -> str:
-    """Returns the PostgreSQL schema for prompt context."""
-    return """
-    Table: product_sales
-    Columns:
-      - id (SERIAL PRIMARY KEY)
-      - region (VARCHAR(50)) -- 'North America', 'Europe', 'Asia-Pacific'
-      - product_line (VARCHAR(100)) -- 'AR Interior Designer Pro (License)', 'Computer Vision API Tracker'
-      - revenue (NUMERIC(12, 2))
-      - units_sold (INT)
-      - fiscal_quarter (VARCHAR(10)) -- 'Q1-2026'
+    """Dynamically fetches tables and columns from the live PostgreSQL database."""
+    # DB_CONFIG = {
+    #     "host": os.getenv("DB_HOST", "localhost"),
+    #     "port": os.getenv("DB_PORT", "5432"),
+    #     "dbname": os.getenv("DB_NAME", "enterprise_hub"),
+    #     "user": os.getenv("DB_USER", "admin"),
+    #     "password": os.getenv("DB_PASSWORD", "secretpassword"),
+    # }
+    
+    schema_query = """
+    SELECT table_name, column_name, data_type 
+    FROM information_schema.columns 
+    WHERE table_schema = 'public' 
+      AND table_name != 'document_chunks' -- hide our vector store from the agent
+    ORDER BY table_name, ordinal_position;
     """
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        cursor.execute(schema_query)
+        rows = cursor.fetchall()
+        conn.close()
+
+        tables = {}
+        for table_name, column_name, data_type in rows:
+            if table_name not in tables:
+                tables[table_name] = []
+            tables[table_name].append(f"  - {column_name} ({data_type})")
+
+        schema_str = "Live PostgreSQL Database Schema:\n"
+        for table, cols in tables.items():
+            schema_str += f"Table: {table}\n" + "\n".join(cols) + "\n\n"
+
+        return schema_str.strip()
+    except Exception as e:
+        return f"Error reading database schema: {str(e)}"
 
 
 def sql_generator_node(state: AgentState) -> dict:
