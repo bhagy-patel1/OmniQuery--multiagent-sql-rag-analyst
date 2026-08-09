@@ -21,8 +21,11 @@ def run_master_test_matrix():
 
         output = master_graph.invoke(initial_state)
 
+        sql_res = output.get("sql_result")
+        sql_count = len(sql_res) if sql_res is not None else "Not Executed"
+
         print(f"🔀 Routed Path:      {output.get('route', '').upper()}")
-        print(f"📊 SQL Rows Fetched: {len(output.get('sql_result') or []) if output.get('sql_result') else 'None'}")
+        print(f"📊 SQL Rows Fetched: {sql_count}")
         print(f"📄 RAG Docs Passed:  {len(output.get('rag_context') or [])}")
         print(f"{'-'*75}")
         print(f"💬 Final Executive Answer:\n{output.get('final_response')}")

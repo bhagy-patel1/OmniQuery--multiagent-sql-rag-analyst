@@ -1,0 +1,9 @@
+Department,Region,Category,Budget,Spend,Fiscal_Quarter
+Engineering,North America,Payroll,1500000.00,1450000.00,Q1-2026
+Engineering,Europe,Payroll,800000.00,780000.00,Q1-2026
+Marketing,Europe,Advertising,450000.00,480000.00,Q1-2026
+Marketing,North America,Advertising,900000.00,850000.00,Q1-2026
+Sales,Asia-Pacific,Operations,800000.00,750000.00,Q1-2026
+Sales,North America,Operations,1200000.00,1250000.00,Q1-2026
+R&D,Global,Research,2000000.00,1950000.00,Q1-2026
+Legal,Europe,Compliance,300000.00,320000.00,Q1-2026
