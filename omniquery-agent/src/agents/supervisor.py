@@ -33,7 +33,6 @@ DB_CONFIG = {
 }
 
 # --- DYNAMIC SCHEMA READERS ---
-
 def get_database_schema() -> str:
     schema_query = """
     SELECT table_name, column_name, data_type 
@@ -74,6 +73,25 @@ def get_csv_schema() -> str:
     except Exception as e:
         return f"Error reading CSV: {str(e)}"
 
+# --- GENERAL CHITCHAT AGENT NODE ---
+# --- GENERAL CHITCHAT AGENT NODE ---
+def general_agent_node(state: AgentState) -> Dict[str, Any]:
+    """Handles greetings, small talk, and questions about bot capabilities directly."""
+    user_query = state["messages"][-1]["content"]
+    prompt = f"""You are OmniQuery, an intelligent enterprise AI data analyst.
+Your capabilities: You can securely query company PostgreSQL databases, CSV spreadsheets, and PDF reports to find answers.
+
+CRITICAL RULES:
+1. NEVER write more than 2 short sentences. 
+2. Be extremely concise to save compute cost. 
+3. NEVER explain generic AI/LLM concepts like "NLP", "machine learning", or "training data".
+4. Just answer the greeting or state your capabilities directly.
+
+User Message: {user_query}
+"""
+    response = llm.invoke(prompt)
+    return {"final_response": response.content.strip()}
+
 # --- POSTGRESQL AGENT NODE ---
 def sql_agent_node(state: AgentState) -> Dict[str, Any]:
     user_query = state["messages"][-1]["content"]
@@ -90,9 +108,9 @@ Schema:
 Rules:
 1. Read-only SELECT queries ONLY.
 2. Return ONLY raw SQL without markdown code blocks.
-3. CRITICAL STRING FILTERING: ALWAYS use ILIKE with leading and trailing percent wildcards on text columns (e.g., WHERE product_line ILIKE '%AR Interior Designer Pro%' AND region ILIKE '%Europe%'). Never use exact '=' for product_line or region.
+3. CRITICAL STRING FILTERING: ALWAYS use ILIKE with leading and trailing percent wildcards on text columns (e.g., WHERE product_line ILIKE '%AR Interior Designer Pro%').
 4. Aggregations: Use SUM(revenue) or SUM(units_sold) when asked for totals or revenues.
-5. Out-of-bounds/Unknown Entities: If asked about entities or years outside the schema (e.g. Apple, iPhone, 2025), write a query that returns 0 rows: SELECT * FROM product_sales WHERE 1=0;
+5. Out-of-bounds/Unknown Entities: Return SELECT * FROM product_sales WHERE 1=0;
 """
         prompt = system_prompt + (f"\nPrevious failed: {sql_query}\nError: {last_error}\nFix for: {user_query}" if last_error else f"\nUser Request: {user_query}")
 
@@ -131,7 +149,7 @@ Schema:
 
 Rules:
 1. Write standard SQL to query the CSV file. 
-2. The table name in your query MUST be EXACTLY: '{CSV_FILE_PATH}'
+2. Table name MUST be: '{CSV_FILE_PATH}'
 3. Use ILIKE with wildcards (%value%) for text filtering.
 4. Return ONLY raw SQL, no markdown formatting.
 """
@@ -190,58 +208,72 @@ def rag_agent_node(state: AgentState) -> Dict[str, Any]:
 def supervisor_node(state: AgentState) -> Dict[str, Any]:
     user_query = state["messages"][-1]["content"]
     prompt = f"""You are the Master Supervisor Router for OmniQuery.
-Classify the query into EXACTLY one category based on required data sources:
+Classify the user query into EXACTLY one category:
 
-1. 'postgres': Query asks ONLY for numerical metrics/revenue/units from the PostgreSQL database.
-2. 'csv': Query asks ONLY for ad-hoc financial/budget/department spreadsheet metrics.
-3. 'pdf': Query asks ONLY for qualitative reasons, explanations, roadmaps, or PDF reports.
-4. 'multiple': Query asks for BOTH numerical metrics AND qualitative explanation/context.
+1. 'general': Greetings ("hi", "hello"), casual conversation, or meta-questions about what you can do/your features.
+2. 'postgres': Query asks ONLY for numerical metrics/revenue/units from PostgreSQL database.
+3. 'csv': Query asks ONLY for ad-hoc financial/budget/department spreadsheet metrics.
+4. 'pdf': Query asks ONLY for qualitative reasons, explanations, roadmaps, or PDF reports.
+5. 'multiple': Query asks for BOTH numerical metrics AND qualitative explanation/context.
 
-Output ONLY one word: 'postgres', 'csv', 'pdf', or 'multiple'.
+Output ONLY one word: 'general', 'postgres', 'csv', 'pdf', or 'multiple'.
 User Query: {user_query}
 """
     response = llm.invoke(prompt)
     route = response.content.strip().lower().replace("'", "").replace('"', "")
-    if route not in ["postgres", "csv", "pdf", "multiple"]:
-        route = "multiple"
+    if route not in ["general", "postgres", "csv", "pdf", "multiple"]:
+        route = "general"
     return {"route": route}
 
 def route_supervisor(state: AgentState) -> List[str]:
-    route = state.get("route", "multiple")
-    if route == "postgres": return ["sql_agent"]
+    route = state.get("route", "general")
+    if route == "general": return ["general_agent"]
+    elif route == "postgres": return ["sql_agent"]
     elif route == "csv": return ["csv_agent"]
     elif route == "pdf": return ["rag_agent"]
     else: return ["sql_agent", "csv_agent", "rag_agent"]
 
-# --- EXECUTIVE SYNTHESIZER NODE (UPGRADED FORMATTING) ---
+# --- EXECUTIVE SYNTHESIZER NODE ---
 def synthesizer_node(state: AgentState) -> Dict[str, Any]:
+    # Pass through general chitchat answers directly
+    if state.get("final_response") and state.get("route") == "general":
+        return {"final_response": state["final_response"]}
+
     user_query = state["messages"][-1]["content"]
-    route = state.get("route", "multiple")
     
-    # Filter out empty or error-heavy outputs
     sql_res = state.get('sql_result')
     csv_res = state.get('csv_result')
     rag_ctx = state.get('rag_context')
 
-    prompt = f"""You are OmniQuery's Chief Analytics Officer presenting an executive briefing for senior leadership.
+    # Check if ANY source returned actual data
+    has_sql_data = bool(sql_res)
+    has_csv_data = bool(csv_res)
+    has_rag_data = bool(rag_ctx)
+    has_any_data = has_sql_data or has_csv_data or has_rag_data
+
+    # 1. CLEAN SIMPLE FALLBACK WHEN NO DATA IS FOUND
+    if not has_any_data:
+        return {
+            "final_response": f"I searched your internal databases and document repositories, but no matching enterprise records or information were found for **\"{user_query}\"**."
+        }
+
+    # 2. RICH EXECUTIVE MARKDOWN ONLY WHEN DATA IS FOUND
+    prompt = f"""You are OmniQuery's Chief Analytics Officer presenting an executive briefing.
 
 User Question: {user_query}
 
 === Data Feeds ===
-Database Feed (PostgreSQL): {sql_res if sql_res else 'No records found.'}
-Spreadsheet Feed (CSV): {csv_res if csv_res else 'No records found.'}
-Document Context (PDF Excerpts): {rag_ctx if rag_ctx else 'No document excerpts found.'}
+Database Feed (PostgreSQL): {sql_res if sql_res else 'None'}
+Spreadsheet Feed (CSV): {csv_res if csv_res else 'None'}
+Document Context (PDF Excerpts): {rag_ctx if rag_ctx else 'None'}
 
 === EXECUTIVE FORMATTING REQUIREMENTS ===
-1. STRICT SILENCE ON INTERNAL MECHANICS: Never mention internal systems, technical failures, code execution, table names, or error messages (e.g. NEVER say "CSV parsing error", "DuckDB", "SQL query", or "database execution").
-2. OUT-OF-BOUNDS / NO DATA: If all feeds return "No records found", state clearly in 2 polite sentences that no matching enterprise records exist for this query.
-3. EXECUTIVE MARKDOWN STRUCTURE:
+1. STRICT SILENCE ON INTERNAL MECHANICS: Never mention system errors, missing files, or internal query logic.
+2. STRUCTURE (Include sections only when relevant content exists):
    - **Executive Summary**: A concise 1-2 sentence direct response.
-   - **Key Metrics** (if numerical data exists): Bullet points bolding all numbers and formatted currency (e.g. **$420,000.00**, **15% slowdown**).
-   - **Operational Insights** (if document context exists): Clean paragraphs explaining qualitative causes or roadmap details.
-   - **Sources**: Cite PDF documents naturally at the end (e.g., *Source: Q1_2026_Executive_Summary.pdf*).
-
-Format the output cleanly in standard Markdown.
+   - **Key Metrics** (include ONLY if numerical data exists in Postgres or CSV): Bullet points bolding numbers and formatted currency.
+   - **Operational Insights** (include ONLY if PDF context exists): Detailed explanation of qualitative causes or strategy.
+   - **Sources**: Cite PDF documents naturally at the end (e.g., *Source: Q1_2026_Executive_Summary.pdf*). Do not write "Source: None".
 """
     response = llm.invoke(prompt)
     return {"final_response": response.content.strip()}
@@ -250,6 +282,7 @@ Format the output cleanly in standard Markdown.
 builder = StateGraph(AgentState)
 
 builder.add_node("supervisor", supervisor_node)
+builder.add_node("general_agent", general_agent_node)
 builder.add_node("sql_agent", sql_agent_node)
 builder.add_node("csv_agent", csv_agent_node)
 builder.add_node("rag_agent", rag_agent_node)
@@ -260,9 +293,15 @@ builder.set_entry_point("supervisor")
 builder.add_conditional_edges(
     "supervisor", 
     route_supervisor, 
-    {"sql_agent": "sql_agent", "csv_agent": "csv_agent", "rag_agent": "rag_agent"}
+    {
+        "general_agent": "general_agent",
+        "sql_agent": "sql_agent", 
+        "csv_agent": "csv_agent", 
+        "rag_agent": "rag_agent"
+    }
 )
 
+builder.add_edge("general_agent", "synthesizer")
 builder.add_edge("sql_agent", "synthesizer")
 builder.add_edge("csv_agent", "synthesizer")
 builder.add_edge("rag_agent", "synthesizer")
