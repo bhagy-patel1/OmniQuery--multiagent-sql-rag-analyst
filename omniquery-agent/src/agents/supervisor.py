@@ -3,6 +3,7 @@ import re
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import duckdb
+import glob
 from dotenv import load_dotenv
 from typing import Dict, Any, List
 from langgraph.graph import StateGraph, END
@@ -17,7 +18,6 @@ load_dotenv()
 RELEVANCE_THRESHOLD = 0.25
 MAX_RETRIES = 3
 FORBIDDEN_KEYWORDS = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "REVOKE"]
-CSV_FILE_PATH = "./data/financial_data.csv"
 
 cohere_api_key = os.getenv("COHERE_API_KEY")
 embeddings_model = CohereEmbeddings(model="embed-english-v3.0", cohere_api_key=cohere_api_key)
@@ -32,8 +32,21 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", "secretpassword"),
 }
 
+# --- 🚨 FIX: STRICT PAST-ONLY HISTORY FORMATTER ---
+def format_chat_history(messages: List[Dict[str, Any]]) -> str:
+    """Formats ONLY past context. Explicitly skips the latest user message to avoid AI confusion."""
+    if not messages or len(messages) <= 1:
+        return "No prior context."
+    formatted = []
+    # Skip the very last message (-1) because that is the current query
+    for msg in messages[-6:-1]:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        formatted.append(f"{role}: {msg.get('content')}")
+    return "\n".join(formatted)
+
 # --- DYNAMIC SCHEMA READERS ---
-def get_database_schema() -> str:
+def get_database_schema(db_config: Optional[Dict[str, Any]] = None) -> str:
+    target_config = db_config if db_config else DB_CONFIG
     schema_query = """
     SELECT table_name, column_name, data_type 
     FROM information_schema.columns 
@@ -42,7 +55,9 @@ def get_database_schema() -> str:
     ORDER BY table_name, ordinal_position;
     """
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        conn_config = target_config.copy()
+        conn_config["connect_timeout"] = 3
+        conn = psycopg2.connect(**conn_config)
         cursor = conn.cursor()
         cursor.execute(schema_query)
         rows = cursor.fetchall()
@@ -61,58 +76,49 @@ def get_database_schema() -> str:
     except Exception as e:
         return f"Error reading database schema: {str(e)}"
 
-def get_csv_schema() -> str:
-    if not os.path.exists(CSV_FILE_PATH):
-        return "No CSV file found."
-    try:
-        schema_data = duckdb.sql(f"DESCRIBE SELECT * FROM '{CSV_FILE_PATH}'").fetchall()
-        schema_str = f"Target File: {CSV_FILE_PATH}\nColumns:\n"
-        for row in schema_data:
-            schema_str += f"  - {row[0]} ({row[1]})\n"
-        return schema_str.strip()
-    except Exception as e:
-        return f"Error reading CSV: {str(e)}"
-
-# --- GENERAL CHITCHAT AGENT NODE ---
 # --- GENERAL CHITCHAT AGENT NODE ---
 def general_agent_node(state: AgentState) -> Dict[str, Any]:
-    """Handles greetings, small talk, and questions about bot capabilities directly."""
     user_query = state["messages"][-1]["content"]
     prompt = f"""You are OmniQuery, an intelligent enterprise AI data analyst.
-Your capabilities: You can securely query company PostgreSQL databases, CSV spreadsheets, and PDF reports to find answers.
-
-CRITICAL RULES:
-1. NEVER write more than 2 short sentences. 
-2. Be extremely concise to save compute cost. 
-3. NEVER explain generic AI/LLM concepts like "NLP", "machine learning", or "training data".
-4. Just answer the greeting or state your capabilities directly.
-
 User Message: {user_query}
+CRITICAL RULES:
+1. NEVER write more than 2 short sentences.
+2. Be extremely concise.
+3. Just answer the greeting or state your capabilities directly.
 """
     response = llm.invoke(prompt)
     return {"final_response": response.content.strip()}
 
 # --- POSTGRESQL AGENT NODE ---
 def sql_agent_node(state: AgentState) -> Dict[str, Any]:
+    history = format_chat_history(state.get("messages", []))
     user_query = state["messages"][-1]["content"]
+    user_db_config = state.get("user_db_config")
+    target_config = user_db_config if user_db_config else DB_CONFIG
+
     retry_count = 0
     last_error = None
     sql_query = ""
-    db_schema = get_database_schema()
+    db_schema = get_database_schema(target_config)
 
     while retry_count <= MAX_RETRIES:
         system_prompt = f"""You are a PostgreSQL expert for OmniQuery.
 Schema:
 {db_schema}
 
+PAST CONVERSATION HISTORY (Use for Pronoun Resolution):
+{history}
+
+CURRENT USER QUERY:
+{user_query}
+
 Rules:
 1. Read-only SELECT queries ONLY.
-2. Return ONLY raw SQL without markdown code blocks.
-3. CRITICAL STRING FILTERING: ALWAYS use ILIKE with leading and trailing percent wildcards on text columns (e.g., WHERE product_line ILIKE '%AR Interior Designer Pro%').
-4. Aggregations: Use SUM(revenue) or SUM(units_sold) when asked for totals or revenues.
-5. Out-of-bounds/Unknown Entities: Return SELECT * FROM product_sales WHERE 1=0;
+2. PRONOUN RESOLUTION: If the query uses "he", "she", "it", or "they", look at the PAST HISTORY, identify the exact entity name, and use that name in your WHERE clause.
+3. EXTRACT KEYWORDS: NEVER put the user's entire sentence inside an ILIKE clause. Extract only exact data points (e.g., 'France').
+4. Return ONLY raw SQL without markdown.
 """
-        prompt = system_prompt + (f"\nPrevious failed: {sql_query}\nError: {last_error}\nFix for: {user_query}" if last_error else f"\nUser Request: {user_query}")
+        prompt = system_prompt + (f"\nPrevious failed: {sql_query}\nError: {last_error}\nFix for: {user_query}" if last_error else "")
 
         response = llm.invoke(prompt)
         sql_query = response.content.strip().replace("```sql", "").replace("```", "").strip()
@@ -122,7 +128,9 @@ Rules:
             return {"sql_query": sql_query, "sql_result": None, "sql_status": "blocked", "sql_error": "Forbidden operation blocked."}
 
         try:
-            conn = psycopg2.connect(**DB_CONFIG)
+            conn_config = target_config.copy()
+            conn_config["connect_timeout"] = 5
+            conn = psycopg2.connect(**conn_config)
             conn.set_session(readonly=True)
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             cursor.execute(sql_query)
@@ -135,26 +143,54 @@ Rules:
 
     return {"sql_query": sql_query, "sql_result": None, "sql_status": "failed", "sql_error": last_error, "sql_retry_count": retry_count}
 
-# --- DUCKDB CSV AGENT NODE ---
+# --- SESSION-AWARE DUCKDB CSV AGENT NODE ---
 def csv_agent_node(state: AgentState) -> Dict[str, Any]:
+    history = format_chat_history(state.get("messages", []))
     user_query = state["messages"][-1]["content"]
-    schema = get_csv_schema()
+    session_id = state.get("session_id", "default")
+    session_dir = f"./data/uploads/{session_id}/"
+    
+    csv_files = glob.glob(os.path.join(session_dir, "*.csv"))
 
-    if "No CSV file found" in schema:
-        return {"csv_error": "CSV file not found.", "csv_result": None}
+    if not csv_files:
+        return {"csv_error": "No CSV files uploaded for this session.", "csv_result": None}
+
+    schema_str = ""
+    for csv_path in csv_files:
+        safe_path = csv_path.replace('\\', '/')
+        try:
+            schema_data = duckdb.sql(f"DESCRIBE SELECT * FROM '{safe_path}'").fetchall()
+            sample_rows = duckdb.sql(f"SELECT * FROM '{safe_path}' LIMIT 3").df().to_dict(orient="records")
+            schema_str += f"Table Name: '{safe_path}'\nColumns:\n"
+            for row in schema_data: schema_str += f"  - {row[0]} ({row[1]})\n"
+            schema_str += f"Sample Data:\n{sample_rows}\n\n"
+        except Exception as e:
+            schema_str += f"Error reading {safe_path}: {str(e)}\n\n"
 
     system_prompt = f"""You are the CSV Data Agent for OmniQuery.
-Schema:
-{schema}
+Available Datasets & Previews:
+{schema_str}
+
+PAST CONVERSATION HISTORY:
+{history}
+
+CURRENT USER QUERY:
+{user_query}
 
 Rules:
-1. Write standard SQL to query the CSV file. 
-2. Table name MUST be: '{CSV_FILE_PATH}'
-3. Use ILIKE with wildcards (%value%) for text filtering.
-4. Return ONLY raw SQL, no markdown formatting.
+1. Write standard SQL. The table name MUST EXACTLY match the 'Table Name' provided above.
+2. CRITICAL - COLUMN NAMES: If a column name has spaces (e.g., 'Execution Price'), you MUST wrap it in double quotes (e.g., "Execution Price"). DO NOT invent underscores.
+3. CRITICAL - SINGLE QUERY ONLY: Generate exactly ONE SQL statement. DO NOT chain multiple queries with semicolons. If querying multiple files, you MUST use a JOIN.
+4. PRONOUN RESOLUTION: If the user says "he", "she", "it", or "they", look at the PAST HISTORY, find the specific entity they are talking about, and use THAT EXACT NAME in your SQL query.
+5. KEYWORD REASONING: DO NOT wrap the user's whole sentence in ILIKE. Extract ONLY the necessary filter words.
+6. Return ONLY raw SQL, no markdown formatting.
 """
-    response = llm.invoke(system_prompt + f"\nUser Request: {user_query}")
+    response = llm.invoke(system_prompt)
     sql_query = response.content.strip().replace("```sql", "").replace("```", "").strip()
+
+    sql_upper = sql_query.upper()
+    if any(re.search(rf"\b{kw}\b", sql_upper) for kw in FORBIDDEN_KEYWORDS) or sql_upper.count(";") > 1:
+        return {"csv_query": sql_query, "csv_result": None, "csv_error": "Forbidden operation blocked for CSV agent."}
 
     try:
         results_df = duckdb.sql(sql_query).df()
@@ -163,9 +199,10 @@ Rules:
     except Exception as e:
         return {"csv_query": sql_query, "csv_result": None, "csv_error": str(e)}
 
-# --- RAG AGENT NODE ---
+# --- SESSION-AWARE RAG AGENT NODE ---
 def rag_agent_node(state: AgentState) -> Dict[str, Any]:
     user_query = state["messages"][-1]["content"]
+    session_id = state.get("session_id", "default")
 
     try:
         query_vector = embeddings_model.embed_query(user_query)
@@ -175,18 +212,27 @@ def rag_agent_node(state: AgentState) -> Dict[str, Any]:
         conn.set_session(readonly=True)
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        dense_sql = "SELECT id, document_name, chunk_content, 1 - (embedding <=> %s::vector) AS score FROM document_chunks ORDER BY embedding <=> %s::vector LIMIT 10;"
-        cursor.execute(dense_sql, (vector_str, vector_str))
+        dense_sql = """
+        SELECT id, document_name, chunk_content, 1 - (embedding <=> %s::vector) AS score 
+        FROM document_chunks 
+        WHERE session_id = %s
+        ORDER BY embedding <=> %s::vector LIMIT 10;
+        """
+        cursor.execute(dense_sql, (vector_str, session_id, vector_str))
         dense_rows = cursor.fetchall()
 
-        sparse_sql = "SELECT id, document_name, chunk_content, ts_rank_cd(fts_tokens, query) AS score FROM document_chunks, to_tsquery('english', REPLACE(plainto_tsquery('english', %s)::text, '&', '|')) query WHERE fts_tokens @@ query ORDER BY score DESC LIMIT 10;"
-        cursor.execute(sparse_sql, (user_query,))
+        sparse_sql = """
+        SELECT id, document_name, chunk_content, ts_rank_cd(fts_tokens, query) AS score 
+        FROM document_chunks, to_tsquery('english', REPLACE(plainto_tsquery('english', %s)::text, '&', '|')) query 
+        WHERE fts_tokens @@ query AND session_id = %s
+        ORDER BY score DESC LIMIT 10;
+        """
+        cursor.execute(sparse_sql, (user_query, session_id))
         sparse_rows = cursor.fetchall()
         conn.close()
 
         rrf_map = {}
-        for i, r in enumerate(dense_rows):
-            rrf_map[str(r["id"])] = {"doc": r["document_name"], "text": r["chunk_content"], "score": 1.0 / (60 + i + 1)}
+        for i, r in enumerate(dense_rows): rrf_map[str(r["id"])] = {"doc": r["document_name"], "text": r["chunk_content"], "score": 1.0 / (60 + i + 1)}
         for i, r in enumerate(sparse_rows):
             doc_id = str(r["id"])
             if doc_id in rrf_map: rrf_map[doc_id]["score"] += 1.0 / (60 + i + 1)
@@ -206,18 +252,24 @@ def rag_agent_node(state: AgentState) -> Dict[str, Any]:
 
 # --- SUPERVISOR ROUTER NODE ---
 def supervisor_node(state: AgentState) -> Dict[str, Any]:
+    history = format_chat_history(state.get("messages", []))
     user_query = state["messages"][-1]["content"]
+    
     prompt = f"""You are the Master Supervisor Router for OmniQuery.
-Classify the user query into EXACTLY one category:
+PAST CONVERSATION CONTEXT:
+{history}
 
-1. 'general': Greetings ("hi", "hello"), casual conversation, or meta-questions about what you can do/your features.
-2. 'postgres': Query asks ONLY for numerical metrics/revenue/units from PostgreSQL database.
-3. 'csv': Query asks ONLY for ad-hoc financial/budget/department spreadsheet metrics.
-4. 'pdf': Query asks ONLY for qualitative reasons, explanations, roadmaps, or PDF reports.
-5. 'multiple': Query asks for BOTH numerical metrics AND qualitative explanation/context.
+CURRENT USER QUERY: 
+{user_query}
 
-Output ONLY one word: 'general', 'postgres', 'csv', 'pdf', or 'multiple'.
-User Query: {user_query}
+Classify into EXACTLY one category:
+1. 'general': ONLY for basic greetings ("hi", "hello"). NEVER use this for actual questions, facts, or follow-ups.
+2. 'postgres': Asking for metrics/records from PostgreSQL.
+3. 'csv': Asking about uploaded CSVs, OR answering follow-up questions to previous spreadsheet queries.
+4. 'pdf': ANY factual question asking "Why", "Explain", "What is", or referring to qualitative context from documents/PDFs.
+5. 'multiple': Requires combining structured metrics WITH text explanations.
+
+Output ONLY one word from the list above.
 """
     response = llm.invoke(prompt)
     route = response.content.strip().lower().replace("'", "").replace('"', "")
@@ -235,52 +287,73 @@ def route_supervisor(state: AgentState) -> List[str]:
 
 # --- EXECUTIVE SYNTHESIZER NODE ---
 def synthesizer_node(state: AgentState) -> Dict[str, Any]:
-    # Pass through general chitchat answers directly
+    # 1. Direct pass-through for general chitchat
     if state.get("final_response") and state.get("route") == "general":
         return {"final_response": state["final_response"]}
 
+    history = format_chat_history(state.get("messages", []))
     user_query = state["messages"][-1]["content"]
     
     sql_res = state.get('sql_result')
     csv_res = state.get('csv_result')
     rag_ctx = state.get('rag_context')
+    
+    csv_err = state.get('csv_error')
+    sql_err = state.get('sql_error')
+    rag_err = state.get('rag_error')
+    sql_status = state.get('sql_status')
 
-    # Check if ANY source returned actual data
-    has_sql_data = bool(sql_res)
-    has_csv_data = bool(csv_res)
-    has_rag_data = bool(rag_ctx)
-    has_any_data = has_sql_data or has_csv_data or has_rag_data
-
-    # 1. CLEAN SIMPLE FALLBACK WHEN NO DATA IS FOUND
-    if not has_any_data:
+    # 🚨 FIX: Explicitly handle blocked / unauthorized data modification requests
+    if sql_status == "blocked" or (csv_err and "Forbidden operation" in str(csv_err)):
         return {
-            "final_response": f"I searched your internal databases and document repositories, but no matching enterprise records or information were found for **\"{user_query}\"**."
+            "final_response": (
+                "⚠️ **Access Control Notice**: I do not have the authority or permission "
+                "to perform data modification operations (such as `DELETE`, `UPDATE`, `INSERT`, or `DROP`). "
+                "OmniQuery is engineered strictly as a **read-only** analytical assistant to safeguard database integrity."
+            )
         }
 
-    # 2. RICH EXECUTIVE MARKDOWN ONLY WHEN DATA IS FOUND
-    prompt = f"""You are OmniQuery's Chief Analytics Officer presenting an executive briefing.
+    has_any_data = bool(sql_res) or bool(csv_res) or bool(rag_ctx)
+    has_any_error = bool(csv_err) or bool(sql_err) or bool(rag_err)
 
-User Question: {user_query}
+    # 2. Handle cases where no data was retrieved
+    if not has_any_data:
+        error_msg = ""
+        if has_any_error:
+            error_msg = "\n\n**System Diagnostics:**"
+            if sql_err: error_msg += f"\n- Database Error: `{sql_err}`"
+            if csv_err: error_msg += f"\n- Spreadsheet Error: `{csv_err}`"
+            if rag_err: error_msg += f"\n- Document Error: `{rag_err}`"
+            
+        return {"final_response": f"I searched your connected databases and documents, but no matching records were found for **\"{user_query}\"**.{error_msg}"}
+
+    # 3. Synthesize data output when records are returned
+    prompt = f"""You are OmniQuery's Chief Analytics Officer.
+PAST CONTEXT:
+{history}
+
+CURRENT QUESTION: 
+{user_query}
 
 === Data Feeds ===
-Database Feed (PostgreSQL): {sql_res if sql_res else 'None'}
-Spreadsheet Feed (CSV): {csv_res if csv_res else 'None'}
-Document Context (PDF Excerpts): {rag_ctx if rag_ctx else 'None'}
+Database Feed: {sql_res if sql_res else 'None'}
+Spreadsheet Feed: {csv_res if csv_res else 'None'}
+Document Context: {rag_ctx if rag_ctx else 'None'}
 
-=== EXECUTIVE FORMATTING REQUIREMENTS ===
-1. STRICT SILENCE ON INTERNAL MECHANICS: Never mention system errors, missing files, or internal query logic.
-2. STRUCTURE (Include sections only when relevant content exists):
-   - **Executive Summary**: A concise 1-2 sentence direct response.
-   - **Key Metrics** (include ONLY if numerical data exists in Postgres or CSV): Bullet points bolding numbers and formatted currency.
-   - **Operational Insights** (include ONLY if PDF context exists): Detailed explanation of qualitative causes or strategy.
-   - **Sources**: Cite PDF documents naturally at the end (e.g., *Source: Q1_2026_Executive_Summary.pdf*). Do not write "Source: None".
+=== REQUIREMENTS ===
+1. Answer directly using ONLY the data feeds provided.
+2. If asked for a summary, provide a concise overview.
+3. NEVER mention system internals.
+4. STRUCTURE:
+   - **Executive Summary**: A concise response.
+   - **Key Metrics / Data**: Bullet points bolding important fields.
+   - **Sources**: Cite PDF names naturally if context exists.
 """
     response = llm.invoke(prompt)
     return {"final_response": response.content.strip()}
 
 # --- BUILD MASTER GRAPH ---
 builder = StateGraph(AgentState)
-
 builder.add_node("supervisor", supervisor_node)
 builder.add_node("general_agent", general_agent_node)
 builder.add_node("sql_agent", sql_agent_node)
@@ -289,18 +362,11 @@ builder.add_node("rag_agent", rag_agent_node)
 builder.add_node("synthesizer", synthesizer_node)
 
 builder.set_entry_point("supervisor")
-
 builder.add_conditional_edges(
     "supervisor", 
     route_supervisor, 
-    {
-        "general_agent": "general_agent",
-        "sql_agent": "sql_agent", 
-        "csv_agent": "csv_agent", 
-        "rag_agent": "rag_agent"
-    }
+    {"general_agent": "general_agent", "sql_agent": "sql_agent", "csv_agent": "csv_agent", "rag_agent": "rag_agent"}
 )
-
 builder.add_edge("general_agent", "synthesizer")
 builder.add_edge("sql_agent", "synthesizer")
 builder.add_edge("csv_agent", "synthesizer")

@@ -1,0 +1,27 @@
+[project]
+name = "omniquery-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "cohere>=5.11.0",
+    "fastapi>=0.111.0",
+    "langchain-community>=0.2.1",
+    "langchain-openai>=0.1.7",
+    "langgraph>=0.1.14",
+    "psycopg2>=2.9.12",
+    "psycopg2-binary>=2.9.9",
+    "pydantic>=2.7.4",
+    "python-dotenv>=1.0.1",
+    "streamlit>=1.35.0",
+    "uvicorn>=0.29.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+]
+
+[tool.pyright]
+extraPaths = ["."]
